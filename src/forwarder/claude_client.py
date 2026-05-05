@@ -1,36 +1,47 @@
-"""Anthropic Claude Compliance API client.
+"""Anthropic Claude Compliance API — Activity Feed client.
 
-The Compliance API is the documented source for Claude Platform audit events
-on Enterprise plans. It is *not* the Usage/Cost API.
+Conforms to the Compliance API spec **Rev J, 2026-04-20** (PDF, distributed by
+Anthropic to Enterprise customers with the Compliance API enabled).
 
 Key references:
-  - Overview:  https://claude.com/blog/claude-platform-compliance-api
-  - Enable:    https://support.claude.com/en/articles/13015708-access-the-compliance-api
-  - Audit log
-    schema:    https://support.claude.com/en/articles/9970975-access-audit-logs
+  - Spec PDF:   "Compliance API: Activity Feed, Chats, Files, Organizations,
+                Users, and Projects" — Rev J, 2026-04-20
+  - Enable:     https://support.claude.com/en/articles/13015708-access-the-compliance-api
+  - Overview:   https://claude.com/blog/claude-platform-compliance-api
 
-PUBLIC DOCS DO NOT DISCLOSE the exact endpoint path or pagination parameter
-names — those are in a PDF spec issued through the Anthropic Trust Center to
-customers with the Compliance API enabled. The constants below are educated
-guesses aligned with the sibling Usage/Cost Admin API conventions and are
-flagged with TODO(compliance-pdf). Override at deploy time via env var if your
-PDF says otherwise:
+This client only implements the **Activity Feed** endpoint, which is the
+right scope for forwarding audit-relevant events to a SIEM. The other
+Compliance API endpoints (chats, files, projects) cover content access /
+e-discovery use cases and are out of scope here.
 
-    COMPLIANCE_API_PATH=/v1/organizations/<actual_path_from_pdf>
-
-The client makes no other assumptions about the wire format beyond what is
-publicly documented:
-  - `x-api-key` header carries an Admin API key (`sk-ant-admin01-...`)
-  - `anthropic-version: 2023-06-01` header is required
-  - Time filter uses ISO 8601 timestamps
-  - Event payload contains the documented fields:
-        created_at, actor_info, event, event_info, entity_info,
-        ip_address, device_id, user_agent, client_platform
+Activity Feed (Rev J):
+    GET https://api.anthropic.com/v1/compliance/activities
+    Headers:
+        x-api-key: sk-ant-admin01-... (Admin key — Console/API customers)
+                or sk-ant-api01-...   (Compliance Access Key — Claude.ai)
+    Query params:
+        created_at.gte / .gt / .lte / .lt   RFC 3339 inequalities
+        organization_ids[]                  repeatable filter
+        actor_ids[]                         repeatable filter
+        activity_types[]                    repeatable filter
+        after_id / before_id                cursor by activity_id
+        limit                               default 100, max 5000
+    Response:
+        data: [Activity]                    newest-first within each page
+        has_more: bool
+        first_id: string                    pass as before_id for prev page
+                                            (prev = forwards in time)
+        last_id: string                     pass as after_id for next page
+                                            (next = backwards in time)
+    Activity object:
+        id, created_at, organization_id, organization_uuid, actor, type,
+        plus type-specific extra fields
+    Activity ordering:
+        Reverse chronological (newest first), ties broken by activity id.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -45,73 +56,70 @@ import urllib3
 log = logging.getLogger(__name__)
 
 ANTHROPIC_API_BASE = "https://api.anthropic.com"
+# Not strictly required by the Compliance API per Rev J (the PDF curl examples
+# do not include it), but the wider Anthropic Admin API requires it and
+# Compliance API runs on the same surface — include it defensively.
 ANTHROPIC_VERSION = "2023-06-01"
 
-# TODO(compliance-pdf): verify against the Compliance API PDF from the Anthropic
-# Trust Center. The path is not disclosed in any public Anthropic page indexed
-# at the time of writing. Set COMPLIANCE_API_PATH env var to override.
+# Confirmed against Rev J spec; overridable via env var so a future revision
+# moving the path doesn't require a code change.
 COMPLIANCE_API_PATH = os.environ.get(
-    "COMPLIANCE_API_PATH", "/v1/organizations/audit_logs"
+    "COMPLIANCE_API_PATH", "/v1/compliance/activities"
 )
 
-# TODO(compliance-pdf): verify pagination param names. The sibling Usage/Cost
-# Admin API uses `page` (token) + `has_more` + `next_page` + `limit`. We assume
-# Compliance API follows the same convention.
+# Activity Feed pagination (Rev J).
 PARAM_LIMIT = "limit"
-PARAM_PAGE = "page"
-PARAM_STARTING_AT = "starting_at"
-PARAM_ENDING_AT = "ending_at"
-RESP_HAS_MORE = "has_more"
-RESP_NEXT_PAGE = "next_page"
+PARAM_AFTER_ID = "after_id"
+PARAM_BEFORE_ID = "before_id"
+PARAM_CREATED_AT_GTE = "created_at.gte"
+PARAM_CREATED_AT_LTE = "created_at.lte"
 RESP_DATA = "data"
+RESP_HAS_MORE = "has_more"
+RESP_FIRST_ID = "first_id"
+RESP_LAST_ID = "last_id"
 
+# Default page size. Rev J max is 5000; 1000 keeps responses small enough to
+# parse without memory pressure and minimises per-page latency.
 PAGE_LIMIT = 1000
+
+# Admin keys grant `read:compliance_activities` (Activity Feed only).
+# Compliance Access Keys can carry that scope plus user-data scopes.
+_VALID_KEY_PREFIXES = ("sk-ant-admin01-", "sk-ant-api01-")
 
 
 @dataclass
-class AuditEvent:
-    """Audit event using the publicly documented schema.
+class ActivityEvent:
+    """Compliance API Activity object (Rev J).
 
-    Field names match the support.claude.com/articles/9970975-access-audit-logs
-    listing. There is no documented top-level event-id field, so we dedupe by
-    a content hash and watermark by `created_at`.
+    `actor` holds a nested object whose `type` field discriminates the
+    variant (UserActor / ApiActor / AdminApiKeyActor / UnauthenticatedUserActor
+    / AnthropicActor / ScimDirectorySyncActor). We do not flatten it — the
+    nested structure is what XSIAM ingests.
     """
 
+    id: str
     created_at: str
-    event: str
-    actor_info: dict = field(default_factory=dict)
-    event_info: dict = field(default_factory=dict)
-    entity_info: dict = field(default_factory=dict)
-    ip_address: str | None = None
-    device_id: str | None = None
-    user_agent: str | None = None
-    client_platform: str | None = None
+    type: str
+    actor: dict = field(default_factory=dict)
+    organization_id: str | None = None
+    organization_uuid: str | None = None
     raw: dict = field(default_factory=dict)
 
     @classmethod
-    def from_payload(cls, payload: dict) -> "AuditEvent":
+    def from_payload(cls, payload: dict) -> "ActivityEvent":
         return cls(
+            id=payload["id"],
             created_at=payload["created_at"],
-            event=payload.get("event", ""),
-            actor_info=payload.get("actor_info") or {},
-            event_info=payload.get("event_info") or {},
-            entity_info=payload.get("entity_info") or {},
-            ip_address=payload.get("ip_address"),
-            device_id=payload.get("device_id"),
-            user_agent=payload.get("user_agent"),
-            client_platform=payload.get("client_platform"),
+            type=payload.get("type", "unknown"),
+            actor=payload.get("actor") or {},
+            organization_id=payload.get("organization_id"),
+            organization_uuid=payload.get("organization_uuid"),
             raw=payload,
         )
 
     @property
     def created_at_dt(self) -> datetime:
         return datetime.fromisoformat(self.created_at.replace("Z", "+00:00"))
-
-    @property
-    def content_hash(self) -> str:
-        """Stable hash for dedupe across overlapping fetch windows."""
-        canonical = json.dumps(self.raw, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class ComplianceAPIError(RuntimeError):
@@ -121,18 +129,20 @@ class ComplianceAPIError(RuntimeError):
 class ClaudeComplianceClient:
     def __init__(
         self,
-        admin_api_key: str,
+        api_key: str,
         api_base: str = ANTHROPIC_API_BASE,
         api_path: str = COMPLIANCE_API_PATH,
         http: urllib3.PoolManager | None = None,
     ):
-        if not admin_api_key.startswith("sk-ant-admin"):
+        if not api_key.startswith(_VALID_KEY_PREFIXES):
             raise ValueError(
-                "Compliance API requires an Admin API key (sk-ant-admin01-...). "
-                "Compliance access keys are issued via Org settings → Data and "
-                "Privacy after enabling the Compliance API."
+                "Compliance API requires either an Admin key "
+                "(sk-ant-admin01-...) provisioned via Console → Settings → "
+                "Admin keys, OR a Compliance Access Key (sk-ant-api01-...) "
+                "issued via Claude.ai → Org settings → Data and Privacy → "
+                "Compliance access keys. Got a key with neither prefix."
             )
-        self._key = admin_api_key
+        self._key = api_key
         self._base = api_base.rstrip("/")
         self._path = api_path
         self._http = http or urllib3.PoolManager(retries=False, timeout=30.0)
@@ -149,59 +159,59 @@ class ClaudeComplianceClient:
         self,
         starting_at: datetime,
         ending_at: datetime,
-    ) -> Iterator[AuditEvent]:
-        """Yield audit events whose `created_at` falls in [starting_at, ending_at).
+    ) -> Iterator[ActivityEvent]:
+        """Yield activities whose `created_at` falls in [starting_at, ending_at].
 
-        Yielded oldest-first so callers can advance a watermark monotonically.
-        Pages through the documented sibling-API pagination scheme; if the
-        Compliance API uses a different scheme, override the PARAM_* / RESP_*
-        constants or supply your own client.
+        Pagination strategy (Rev J Activity Feed):
+        - Filter by `created_at.gte` / `created_at.lte`.
+        - The API returns newest-first within each page.
+        - Page through OLDER events using `after_id={last_id}` until
+          `has_more=false`.
+        - Sort the accumulated events ascending by (created_at, id) and yield,
+          so the caller's watermark advances monotonically and a mid-batch
+          crash resumes correctly.
         """
-        params: dict = {
+        base_params = {
             PARAM_LIMIT: PAGE_LIMIT,
-            PARAM_STARTING_AT: starting_at.astimezone(timezone.utc)
-            .isoformat()
-            .replace("+00:00", "Z"),
-            PARAM_ENDING_AT: ending_at.astimezone(timezone.utc)
-            .isoformat()
-            .replace("+00:00", "Z"),
+            PARAM_CREATED_AT_GTE: _iso_z(starting_at),
+            PARAM_CREATED_AT_LTE: _iso_z(ending_at),
         }
-        next_page: str | None = None
-
-        page_buffer: list[AuditEvent] = []
+        after_id: str | None = None
+        accumulated: list[ActivityEvent] = []
         page_count = 0
 
         while True:
-            if next_page:
-                params[PARAM_PAGE] = next_page
+            params = dict(base_params)
+            if after_id:
+                params[PARAM_AFTER_ID] = after_id
             url = f"{self._base}{self._path}?{urlencode(params)}"
-            payload = self._request_with_retry(url)
 
+            payload = self._request_with_retry(url)
             data = payload.get(RESP_DATA, [])
             for raw in data:
-                page_buffer.append(AuditEvent.from_payload(raw))
+                accumulated.append(ActivityEvent.from_payload(raw))
 
             page_count += 1
+
             if not payload.get(RESP_HAS_MORE):
                 break
-            next_page = payload.get(RESP_NEXT_PAGE)
-            if not next_page:
-                # has_more=true but no next_page token — defensive break.
-                log.warning("Compliance API returned has_more without next_page")
+            next_cursor = payload.get(RESP_LAST_ID)
+            if not next_cursor or next_cursor == after_id:
+                # Defensive: API said has_more but didn't advance the cursor.
+                log.warning("Compliance API has_more=true but last_id missing/unchanged")
                 break
+            after_id = next_cursor
 
         log.info(
-            "fetched window starting_at=%s ending_at=%s pages=%d events=%d",
-            params[PARAM_STARTING_AT],
-            params[PARAM_ENDING_AT],
+            "fetched window [%s, %s] pages=%d events=%d",
+            base_params[PARAM_CREATED_AT_GTE],
+            base_params[PARAM_CREATED_AT_LTE],
             page_count,
-            len(page_buffer),
+            len(accumulated),
         )
 
-        # Sort oldest-first regardless of API order, so the watermark always
-        # advances monotonically and a mid-batch crash resumes correctly.
-        page_buffer.sort(key=lambda e: e.created_at)
-        for ev in page_buffer:
+        accumulated.sort(key=lambda e: (e.created_at, e.id))
+        for ev in accumulated:
             yield ev
 
     def _request_with_retry(self, url: str, attempts: int = 4) -> dict:
@@ -211,16 +221,24 @@ class ClaudeComplianceClient:
             if r.status == 404:
                 raise ComplianceAPIError(
                     f"Compliance API path not found: {self._path}. "
-                    "Verify against the Compliance API PDF from the Anthropic "
-                    "Trust Center and override via the COMPLIANCE_API_PATH env "
-                    f"var. Server response: {r.data[:200]!r}"
+                    "Per Rev J the path is /v1/compliance/activities. If a "
+                    "newer revision moved it, override via the "
+                    f"COMPLIANCE_API_PATH env var. Server response: {r.data[:200]!r}"
                 )
             if r.status in (401, 403):
                 raise ComplianceAPIError(
-                    f"Compliance API auth rejected (HTTP {r.status}). Check that "
-                    "(a) the Compliance API is enabled for your organization "
-                    "(Org settings → Data and Privacy), and (b) the Admin API "
-                    f"key has compliance scope. Response: {r.data[:200]!r}"
+                    f"Compliance API auth rejected (HTTP {r.status}). Verify: "
+                    "(a) Compliance API is enabled for your organization "
+                    "(Org settings → Data and Privacy → Compliance API), "
+                    "(b) the key has the read:compliance_activities scope, "
+                    "(c) the key has not been disabled or revoked. "
+                    f"Response: {r.data[:200]!r}"
+                )
+            if r.status == 400:
+                # Rev J 400 includes a structured `error.message` — surface it
+                # to the operator unedited.
+                raise ComplianceAPIError(
+                    f"Compliance API rejected request (HTTP 400): {r.data[:500]!r}"
                 )
             if r.status == 429 or 500 <= r.status < 600:
                 if i == attempts - 1:
@@ -240,3 +258,8 @@ class ClaudeComplianceClient:
                 )
             return json.loads(r.data)
         raise ComplianceAPIError("unreachable")
+
+
+def _iso_z(dt: datetime) -> str:
+    """RFC 3339 with trailing Z, the format the Compliance API expects."""
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")

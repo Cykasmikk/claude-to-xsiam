@@ -69,10 +69,14 @@ class HttpEgress:
         return sent
 
     def _enrich(self, ev: dict) -> dict:
+        # Activity object schema (Compliance API Rev J): top-level `type`
+        # carries the event kind (e.g. claude_chat_created); pass it through
+        # as `_event` for XSIAM routing/filter convenience.
         return {
             "_vendor": self._cfg.vendor,
             "_product": self._cfg.product,
             "_time": ev.get("created_at"),
+            "_event": ev.get("type"),
             "event": ev,
         }
 

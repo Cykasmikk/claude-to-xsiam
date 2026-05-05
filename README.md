@@ -1,8 +1,8 @@
 # claude-xsiam-log-forwarder
 
-Forwards **Claude Platform Compliance API** audit events into **Cortex XSIAM**
-using the cloud-native ingestion patterns documented and reference-architected
-by Palo Alto Networks:
+Forwards **Claude Compliance API — Activity Feed** events into **Cortex
+XSIAM** using the cloud-native ingestion patterns documented and reference-
+architected by Palo Alto Networks:
 
 - **AWS:** Lambda → S3 (gzipped JSON-lines) → S3 ObjectCreated → SQS → XSIAM
   pulls via cross-account IAM role with external ID. Mirrors the Palo-published
@@ -15,17 +15,31 @@ A direct HTTP-Collector path is included as a non-default fallback.
 There is no native Anthropic integration in XSIAM, and no Anthropic-published
 XSIAM connector. This repo is the custom forwarder.
 
+> **Spec conformance:** The Compliance API client conforms to **Rev J,
+> 2026-04-20** of the *Compliance API: Activity Feed, Chats, Files,
+> Organizations, Users, and Projects* spec PDF (distributed by Anthropic to
+> Enterprise customers with the Compliance API enabled). The endpoint path,
+> query parameters, response shape, and Activity object schema are all
+> verified against the PDF; nothing is guessed.
+
 ## What this captures vs. what it does not
 
-The Compliance API records **admin and system events** (sign-in, key creation,
-workspace membership changes, SSO config, settings changes) and **resource
-activity** (file upload/download/deletion, skill creation, etc.). It does
-**not** include inference activity — i.e. user prompts, model responses, or
-tool-call payloads.
+The Compliance API records **activity** events: authentication (sign-in/SSO,
+SCIM provisioning), administrative actions (workspace lifecycle, API key
+lifecycle, RBAC, SSO config), resource activity (chats, files, projects,
+skills), and platform events (rate-limit changes, usage report access).
 
-For inference visibility, deploy [Claude Cowork OpenTelemetry](https://support.claude.com/en/articles/14477985-monitor-claude-cowork-activity-with-opentelemetry)
-as a sibling pipeline. The two feeds correlate via a shared user account
-identifier present in every Cowork OTel event.
+It does **not** include inference activity — i.e. user prompts, model
+responses, or tool-call payloads. Per Rev J:
+
+| Source | Audit (this repo) | Inference content |
+|---|---|---|
+| Claude.ai chats / projects / files | metadata only via Activity Feed | Use the *Compliance API content endpoints* (chats / files / projects) — not implemented here, separate scope |
+| Cowork / Claude Code | (limited) | [Cowork OpenTelemetry](https://support.claude.com/en/articles/14477985-monitor-claude-cowork-activity-with-opentelemetry) — sibling pipeline |
+| Console / Claude API | full Activity Feed coverage | n/a |
+
+Pair this forwarder with Cowork OTel for end-to-end SOC visibility. The two
+feeds correlate by the user account identifier shared between them.
 
 ## Architecture
 
@@ -39,11 +53,11 @@ identifier present in every Cowork OTel event.
                      └──────┬────────┘                └─────┬──────┘
                             │ Compliance API                │ ObjectCreated
                             ▼                               ▼
-                     ┌──────────────┐                ┌──────────────┐
-                     │ api.anthropic│                │  SQS queue   │
-                     │ .com /v1/orgs│                └──────┬───────┘
-                     └──────────────┘                       │ XSIAM polls
-                                                            ▼
+                    ┌────────────────┐               ┌──────────────┐
+                    │ api.anthropic  │               │  SQS queue   │
+                    │ /v1/compliance │               └──────┬───────┘
+                    │  /activities   │                      │ XSIAM polls
+                    └────────────────┘                      ▼
                                                   ┌──────────────────┐
                                                   │  Cortex XSIAM    │
                                                   │   (assumed role  │
@@ -61,11 +75,11 @@ identifier present in every Cowork OTel event.
                      └──────┬──────────┘                        │
                             │ Compliance API                    ▼
                             ▼                          ┌────────────────┐
-                     ┌──────────────┐                  │ XSIAM-bound    │
-                     │ api.anthropic│                  │  subscription  │
-                     │ .com /v1/orgs│                  └────────┬───────┘
-                     └──────────────┘                           │ XSIAM pulls
-                                                                ▼
+                    ┌────────────────┐                 │ XSIAM-bound    │
+                    │ api.anthropic  │                 │  subscription  │
+                    │ /v1/compliance │                 └────────┬───────┘
+                    │  /activities   │                          │ XSIAM pulls
+                    └────────────────┘                          ▼
                                                       ┌──────────────────┐
                                                       │  Cortex XSIAM    │
                                                       │  (SA credential  │
@@ -75,71 +89,52 @@ identifier present in every Cowork OTel event.
 
 ### Idempotency model
 
-The publicly documented Compliance API event schema does not include a stable
-event-id field, so we cannot cursor-by-id. Each tick:
+Per Rev J, every Activity object carries a stable `id` (`activity_xxx`), so
+dedupe keys directly off that ID. Each tick:
 
-1. Loads the prior **watermark** (latest `created_at` ever forwarded) and a
-   bounded set of **recent content hashes** (SHA-256 of canonical event JSON).
-2. Queries the API window `[watermark - 5min, now]` to absorb clock skew and
-   late-arriving events near the boundary.
-3. Drops events whose content hash is already in `recent_hashes`.
+1. Loads prior **watermark** (latest `created_at` ever forwarded) and a
+   bounded set of **recent activity IDs**.
+2. Queries `created_at.gte = watermark - 5min`, `created_at.lte = now` to
+   absorb clock skew and out-of-order delivery.
+3. Drops events whose `id` is already in `recent_ids`.
 4. Forwards the survivors to the configured egress sink.
-5. Persists the advanced watermark + refreshed hash set **only after** the
-   egress sink ACKs. A crash mid-batch replays cleanly on the next tick.
+5. Persists advanced watermark + refreshed ID set **only after** the egress
+   sink ACKs. A crash mid-batch replays the same window cleanly.
 
-XSIAM-side dedupe is recommended as defense-in-depth — the content hash is
-stable and projectable as a join/dedupe key in your XQL.
+Per Rev J the Activity Feed is queryable within ~1 minute of the actual
+event, so the 5-minute overlap is generous insurance.
 
 ## Prerequisites
 
-1. **Claude Enterprise plan.** Compliance API is GA on Enterprise (excluding
+1. **Claude Enterprise plan** (Compliance API is GA on Enterprise, excluding
    Public Sector orgs).
-2. **Compliance API enabled** by an Enterprise Primary Owner under
-   *Organization settings → Data and Privacy → Compliance API → Enable*.
-3. **Admin API key** with Compliance scope (`sk-ant-admin01-...`).
-4. **XSIAM data source pre-info** — depends on which path:
-   - **AWS path:** the AWS account ID of your XSIAM tenant. This is shown in
-     the *Settings → Data Sources → Add → Amazon S3 generic logs* onboarding
-     screen. You'll paste the role ARN, external ID, and SQS URL produced by
-     this Terraform back into that screen after `apply`.
-   - **GCP path:** none in advance. After `apply` you generate a SA key and
-     paste it (along with the subscription name) into the *GCP Pub/Sub* data
-     source onboarding screen.
-   - **HTTP fallback:** an HTTP Collector configured as a Custom App, with
-     its tenant URL and auth token.
-5. **Compliance API spec PDF** from your Anthropic account team — see
-   "Spec verification checklist" below.
-6. Terraform ≥ 1.6.
-
-## Spec verification checklist (DO BEFORE PROD DEPLOY)
-
-The exact endpoint path, time-filter parameter names, and pagination tokens
-of the Compliance API are not on any public Anthropic page — they're in a
-PDF available only to customers with the Compliance API enabled. The client
-in `src/forwarder/claude_client.py` ships with **educated defaults aligned
-with Anthropic's sibling Usage/Cost Admin API** (the closest public Admin API
-spec), marked with `TODO(compliance-pdf)` comments. Verify each against your
-PDF and override:
-
-| Item                        | Default                            | Override                              |
-|-----------------------------|------------------------------------|---------------------------------------|
-| Endpoint path               | `/v1/organizations/audit_logs`     | `COMPLIANCE_API_PATH` env var         |
-| Time filter param (start)   | `starting_at`                      | `PARAM_STARTING_AT` constant          |
-| Time filter param (end)     | `ending_at`                        | `PARAM_ENDING_AT` constant            |
-| Pagination token param      | `page`                             | `PARAM_PAGE` constant                 |
-| Page size param             | `limit`                            | `PARAM_LIMIT` constant                |
-| Response data key           | `data`                             | `RESP_DATA` constant                  |
-| Response has-more flag      | `has_more`                         | `RESP_HAS_MORE` constant              |
-| Response next-page token    | `next_page`                        | `RESP_NEXT_PAGE` constant             |
-
-The client raises an actionable error on HTTP 404 (path wrong, fix env var)
-and on 401/403 (Compliance API not enabled or key lacks scope).
-
-The event-field schema (`created_at`, `actor_info`, `event`, `event_info`,
-`entity_info`, `ip_address`, `device_id`, `user_agent`, `client_platform`)
-**is** documented at
-<https://support.claude.com/en/articles/9970975-access-audit-logs> and is
-used as-is.
+2. **Compliance API enabled** for your organization. The path differs by
+   product surface:
+   - **Claude.ai:** Primary Owner enables it under *Org settings → Data and
+     Privacy → Compliance API*.
+   - **Console / API:** an org admin requests enablement via your Anthropic
+     account team.
+3. **An API key** with Activity Feed access. Per Rev J:
+   - **Admin key** (`sk-ant-admin01-...`), provisioned via *Console → Settings
+     → Admin keys*. When Compliance API is enabled, Admin keys are
+     automatically granted the `read:compliance_activities` scope. **This is
+     the right key for SOC audit forwarding**.
+   - **Compliance Access Key** (`sk-ant-api01-...`), provisioned via *Claude.ai
+     → Org settings → Data and Privacy → Compliance access keys*. Carries
+     scoped access — needs `read:compliance_activities` for this forwarder.
+     Required if you also want to fetch chat/file/project content (separate
+     scope, not used by this forwarder).
+4. **XSIAM data source onboarding info** — depends on which path:
+   - **AWS:** the AWS account ID of your XSIAM tenant (shown in the *Settings
+     → Data Sources → Add → Amazon S3 generic logs* onboarding screen). After
+     `terraform apply`, paste the role ARN, external ID, and SQS URL back
+     into that screen.
+   - **GCP:** none in advance. After `apply`, generate a SA key for the
+     output service account and paste it (with the subscription name) into
+     the *GCP Pub/Sub* data source onboarding screen.
+   - **HTTP fallback:** an HTTP Collector configured as a Custom App with its
+     tenant URL and auth token.
+5. Terraform ≥ 1.6.
 
 ## Repository layout
 
@@ -149,7 +144,7 @@ src/
   requirements.txt        GCP Cloud Build installs these at deploy time
   forwarder/
     core.py               fetch → forward → checkpoint loop
-    claude_client.py      Compliance API client
+    claude_client.py      Compliance API Activity Feed client (Rev J)
     state.py              ForwarderState dataclass + StateStore protocol
     state_aws.py          DynamoDB state backend
     state_gcp.py          Firestore state backend
@@ -165,6 +160,8 @@ terraform/aws/            Lambda + EventBridge + S3 + SQS + cross-account
 terraform/gcp/            Cloud Function + Scheduler + audit Pub/Sub topic
                           + XSIAM-bound subscription + SA + Firestore +
                           Secret Manager
+tests/smoke.py            Deterministic smoke tests (no AWS/GCP creds needed)
+.github/workflows/ci.yml  Python syntax + smoke + terraform validate
 ```
 
 ## Deploy — AWS
@@ -215,10 +212,10 @@ After `apply`:
 
 2. In the XSIAM *GCP Pub/Sub* data source onboarding screen, paste:
 
-   | XSIAM field        | Source                                  |
-   |--------------------|-----------------------------------------|
-   | Subscription name  | `terraform output xsiam_audit_subscription` |
-   | Service account    | the contents of `xsiam-credentials.json`    |
+   | XSIAM field       | Source                                          |
+   |-------------------|-------------------------------------------------|
+   | Subscription name | `terraform output xsiam_audit_subscription`     |
+   | Service account   | the contents of `xsiam-credentials.json`        |
 
 3. Delete the local key file once XSIAM has it.
 
@@ -228,45 +225,76 @@ After the first scheduled run:
 
 ```xql
 dataset = <your_audit_dataset>
-| filter event_info or event   // schema fields from the Compliance API
+| filter type and id   // Compliance API Rev J Activity object fields
 | sort desc _time
 | limit 50
 ```
 
-You should see one row per audit event (sign-in, key creation, workspace
-membership change, SSO config update, etc.). The full event payload includes
-`actor_info`, `event_info`, `entity_info`, `ip_address`, `device_id`,
-`user_agent`, `client_platform`.
+Each row is one Activity object: `id`, `created_at`, `type` (e.g.
+`claude_chat_created`, `sso_login_succeeded`, `platform_api_key_created`),
+`organization_id`, `organization_uuid`, and a nested `actor` object whose
+`actor.type` discriminates user vs. API key vs. SCIM sync vs.
+unauthenticated user vs. Admin API key.
+
+Common SOC queries:
+
+```xql
+// Audit all Admin API key creations across the org
+dataset = <your_audit_dataset>
+| filter type = "admin_api_key_created"
+| fields _time, actor.type, actor.user_id, admin_api_key_id, scopes
+```
+
+```xql
+// SSO failure spike detection
+dataset = <your_audit_dataset>
+| filter type in ("sso_login_failed", "magic_link_login_failed")
+| comp count() by bin(_time, 5m)
+```
+
+```xql
+// Compliance API self-audit (every Compliance API request is itself logged)
+dataset = <your_audit_dataset>
+| filter type = "compliance_api_accessed"
+| fields _time, actor.api_key_id, url, status_code
+```
 
 ## Tuning
 
-| Variable                           | Default | Notes                                              |
-|------------------------------------|---------|----------------------------------------------------|
-| `schedule_minutes`                 | `5`     | Poll cadence. ~5 min freshness SLO on the API.     |
-| `initial_lookback_minutes`         | `60`    | First-run window; later runs use saved state.      |
-| `OVERLAP_SECONDS` (code)           | `300`   | Re-query margin for clock skew at boundary.        |
-| `MAX_RECENT_HASHES` (code)         | `10000` | Bound on dedupe state size (≈640 KB).              |
-| `bucket_object_retention_days` (AWS) | `365` | S3 lifecycle expiry. Set 0 to disable.             |
-| `subscription_message_retention_seconds` (GCP) | `604800` | Subscription buffer if XSIAM is down. |
+| Variable                                    | Default | Notes                                              |
+|---------------------------------------------|---------|----------------------------------------------------|
+| `schedule_minutes`                          | `5`     | Rev J: events queryable within ~1 min of occurrence |
+| `initial_lookback_minutes`                  | `60`    | First-run window; subsequent runs use saved state  |
+| `OVERLAP_SECONDS` (code)                    | `300`   | Re-query margin for clock skew at boundary         |
+| `MAX_RECENT_IDS` (code)                     | `10000` | Bound on dedupe state size                         |
+| `bucket_object_retention_days` (AWS)        | `365`   | S3 lifecycle expiry (Activity Feed itself: 6 years) |
+| `subscription_message_retention_seconds` (GCP) | `604800` | 7-day buffer if XSIAM is down                  |
+| `COMPLIANCE_API_PATH` (env, both clouds)    | `/v1/compliance/activities` | Override for future spec revisions     |
 
 ## Operational notes
 
 - **First run** with no saved state pulls only `initial_lookback_minutes` so
-  you don't accidentally backfill ~180 days of events into XSIAM (the
-  Compliance API's server-side retention).
-- **Failure mode (egress)**: any error from the egress sink aborts before the
-  watermark advances; the next tick replays the same window. Dedupe handles
-  the overlap.
-- **Failure mode (Anthropic)**: 401/403 raises with explicit guidance to
-  verify Compliance API enablement and key scope. 404 prompts to verify the
-  endpoint path against the spec PDF and override `COMPLIANCE_API_PATH`.
-- **Cost:** at the default 5-min cadence, AWS and GCP free tiers cover this.
+  you don't accidentally backfill 6 years of events into XSIAM.
+- **Failure mode (egress)**: any error from the egress sink aborts before
+  the watermark advances. Dedupe (by activity ID) handles the overlap on
+  next tick.
+- **Failure mode (Anthropic)**:
+  - 401/403 raises with explicit guidance to verify Compliance API enablement
+    and `read:compliance_activities` scope.
+  - 404 raises with the Rev J path documented and `COMPLIANCE_API_PATH` env
+    var override.
+  - 400 surfaces the structured `error.message` from the API verbatim.
+- **Self-audit:** every Compliance API request is itself logged as a
+  `compliance_api_accessed` Activity event in the next tick. Useful for the
+  SOC to detect anomalous Compliance API access patterns.
+- **Cost:** at the default 5-min cadence with low audit volume, AWS and GCP
+  free tiers cover this entirely.
 
 ## Falling back to the HTTP Collector path
 
 If you can't (or don't want to) use the native S3/Pub-Sub paths, the
 `src/forwarder/egress/http.py` sink POSTs directly to an XSIAM HTTP
-Collector. To use it, swap the egress instance in your handler:
+Collector. Swap the egress instance in your handler:
 
 ```python
 # in aws_handler.py or gcp_handler.py
@@ -284,13 +312,17 @@ collector configuration screen. The native paths avoid these unknowns.
 
 ## References
 
-- [Compliance API access](https://support.claude.com/en/articles/13015708-access-the-compliance-api)
-- [Compliance API announcement](https://claude.com/blog/claude-platform-compliance-api)
-- [Audit log fields](https://support.claude.com/en/articles/9970975-access-audit-logs)
-- [Usage and Cost API (sibling, public spec reference)](https://platform.claude.com/docs/en/build-with-claude/usage-cost-api)
-- [Cowork OpenTelemetry](https://support.claude.com/en/articles/14477985-monitor-claude-cowork-activity-with-opentelemetry)
-- [Cortex XSIAM — Visibility of logs and alerts from external sources](https://docs-cortex.paloaltonetworks.com/r/Cortex-XSIAM/Cortex-XSIAM-Documentation/Visibility-of-logs-and-alerts-from-external-sources)
-- [Cortex XSIAM — Ingest Logs and Data from a GCP Pub/Sub](https://docs-cortex.paloaltonetworks.com/r/Cortex-XSIAM/Cortex-XSIAM-Documentation/Ingest-Logs-and-Data-from-a-GCP-Pub/Sub)
-- [Cortex XSIAM — Ingest generic logs from Amazon S3](https://docs-cortex.paloaltonetworks.com/r/Cortex-XSIAM/Cortex-XSIAM-Documentation/Ingest-generic-logs-from-Amazon-S3)
-- [Cortex XSIAM — Ingest logs from Amazon CloudWatch](https://docs-cortex.paloaltonetworks.com/r/Cortex-XSIAM/Cortex-XSIAM-Documentation/Ingest-logs-from-Amazon-CloudWatch)
-- [PaloAltoNetworks/terraform-umbrella-s3-to-xsiam-ingestion-module (reference architecture)](https://github.com/PaloAltoNetworks/terraform-umbrella-s3-to-xsiam-ingestion-module)
+- **Anthropic**
+  - [Compliance API access](https://support.claude.com/en/articles/13015708-access-the-compliance-api)
+  - [Compliance API announcement](https://claude.com/blog/claude-platform-compliance-api)
+  - [Admin API overview](https://platform.claude.com/docs/en/build-with-claude/administration-api)
+  - [Cowork OpenTelemetry](https://support.claude.com/en/articles/14477985-monitor-claude-cowork-activity-with-opentelemetry)
+- **Palo Alto / Cortex XSIAM**
+  - [External log sources overview](https://docs-cortex.paloaltonetworks.com/r/Cortex-XSIAM/Cortex-XSIAM-Documentation/Visibility-of-logs-and-alerts-from-external-sources)
+  - [Ingest Logs and Data from a GCP Pub/Sub](https://docs-cortex.paloaltonetworks.com/r/Cortex-XSIAM/Cortex-XSIAM-Documentation/Ingest-Logs-and-Data-from-a-GCP-Pub/Sub)
+  - [Ingest generic logs from Amazon S3](https://docs-cortex.paloaltonetworks.com/r/Cortex-XSIAM/Cortex-XSIAM-Documentation/Ingest-generic-logs-from-Amazon-S3)
+  - [PaloAltoNetworks/terraform-umbrella-s3-to-xsiam-ingestion-module](https://github.com/PaloAltoNetworks/terraform-umbrella-s3-to-xsiam-ingestion-module) (reference architecture)
+- **AWS**
+  - [Lambda runtimes](https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtimes.html)
+- **GCP**
+  - [Cloud Functions Python runtime](https://cloud.google.com/functions/docs/concepts/python-runtime)

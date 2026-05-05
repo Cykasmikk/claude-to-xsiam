@@ -1,15 +1,14 @@
 """Forwarder state backend protocol.
 
-The Compliance API does not document a stable event-id field, so we cannot
-cursor by id. Instead we persist:
+The Compliance API Activity Feed assigns every event a stable `id` of the
+form `activity_xxx`, so dedupe keys directly off that — no content hashing
+needed.
 
-  - `watermark`: ISO 8601 timestamp of the latest event we've forwarded
-  - `recent_hashes`: SHA-256 content hashes of events near the watermark,
-    used to dedupe the inevitable overlap when the next poll re-queries the
-    boundary window to handle clock skew and late-arriving events.
-
-The state document is small (a string + a bounded list), well under DynamoDB
-and Firestore item limits.
+Persisted state:
+  - `watermark`: ISO 8601 `created_at` of the latest event we've forwarded.
+  - `recent_ids`: bounded set of activity IDs at-or-near the watermark.
+    Used to dedupe the inevitable overlap when the next poll re-queries the
+    boundary window to handle clock skew and out-of-order delivery.
 """
 
 from __future__ import annotations
@@ -21,10 +20,10 @@ from typing import Protocol
 @dataclass
 class ForwarderState:
     watermark: str | None = None  # ISO 8601 created_at of newest forwarded event
-    recent_hashes: list[str] = field(default_factory=list)
+    recent_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        return {"watermark": self.watermark, "recent_hashes": self.recent_hashes}
+        return {"watermark": self.watermark, "recent_ids": self.recent_ids}
 
     @classmethod
     def from_dict(cls, d: dict | None) -> "ForwarderState":
@@ -32,7 +31,8 @@ class ForwarderState:
             return cls()
         return cls(
             watermark=d.get("watermark"),
-            recent_hashes=list(d.get("recent_hashes") or []),
+            # Tolerate the legacy field name from before Rev J was published.
+            recent_ids=list(d.get("recent_ids") or d.get("recent_hashes") or []),
         )
 
 

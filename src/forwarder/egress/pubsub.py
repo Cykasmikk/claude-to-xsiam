@@ -61,13 +61,19 @@ class PubSubEgress:
         return len(materialized)
 
     def _attributes(self, ev: dict) -> dict:
-        # Pub/Sub attributes have a 1024-byte value cap; keep them tiny.
+        # Pub/Sub attribute values have a 1024-byte cap; keep them tiny.
+        # Schema follows Compliance API Rev J Activity object: top-level
+        # `type` and `organization_id`, nested `actor.user_id` / `actor.type`.
         attrs = {}
-        if isinstance(ev.get("event"), str):
-            attrs["event"] = ev["event"][:256]
-        actor = ev.get("actor_info") or {}
+        if isinstance(ev.get("type"), str):
+            attrs["activity_type"] = ev["type"][:256]
+        if isinstance(ev.get("organization_id"), str):
+            attrs["organization_id"] = ev["organization_id"][:64]
+        actor = ev.get("actor") or {}
+        if isinstance(actor.get("type"), str):
+            attrs["actor_type"] = actor["type"][:64]
         if isinstance(actor.get("user_id"), str):
             attrs["actor_user_id"] = actor["user_id"][:256]
-        if isinstance(ev.get("client_platform"), str):
-            attrs["client_platform"] = ev["client_platform"][:64]
+        elif isinstance(actor.get("api_key_id"), str):
+            attrs["actor_api_key_id"] = actor["api_key_id"][:256]
         return attrs
