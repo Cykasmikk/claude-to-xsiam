@@ -1,20 +1,23 @@
-"""Cloud-agnostic fetch → forward → checkpoint loop.
+"""Cloud-agnostic + vendor-agnostic fetch → forward → checkpoint loop.
 
 Idempotency model
 -----------------
-Compliance API Rev J assigns every Activity a stable `id` (`activity_xxx`),
-so dedupe is keyed on that ID directly. Each tick:
+Every supported vendor's audit feed assigns a stable per-event `id`, so
+dedupe is keyed on that ID directly. Each tick:
 
-  1. Loads the prior state: a watermark (latest `created_at` ever forwarded)
-     and a bounded set of recent activity IDs.
-  2. Queries the API for the window
+  1. Loads the prior state for this vendor: a watermark (latest `created_at`
+     ever forwarded) and a bounded set of recent IDs.
+  2. Queries the vendor's API for the window
         [watermark - OVERLAP_SECONDS, now]
      to absorb clock skew and out-of-order delivery near the boundary.
   3. Drops events whose `id` is already in `recent_ids`.
   4. Forwards the survivors to the configured egress sink.
   5. Persists the advanced watermark + refreshed ID set **only after** the
-     egress sink ACKs the batch — a crash mid-batch replays the same window
-     cleanly on the next tick.
+     egress sink ACKs — a crash mid-batch replays the same window cleanly
+     on the next tick.
+
+State documents are namespaced by vendor so multiple vendors share one
+DynamoDB table / Firestore collection without cross-contamination.
 """
 
 from __future__ import annotations
@@ -22,35 +25,25 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 
-from .claude_client import ActivityEvent, ClaudeComplianceClient
 from .egress import Egress
 from .state import ForwarderState, StateStore
+from .vendors import AuditClient, AuditEvent
 
 log = logging.getLogger(__name__)
 
-# How far back of the watermark we re-query each tick. Rev J says the
-# Activity Feed is queryable within ~1 minute of the actual event; 5 minutes
-# of overlap is generous insurance against clock skew and out-of-order
-# delivery without re-shipping more than necessary.
 OVERLAP_SECONDS = 300
-
-# Cap on `recent_ids`. With OVERLAP_SECONDS=300 and realistic Enterprise
-# audit volumes (~hundreds/hour), 10 000 IDs is far more than the overlap
-# window will ever contain, while keeping the persisted state document well
-# under DynamoDB's 400 KB and Firestore's 1 MB item-size limits.
 MAX_RECENT_IDS = 10_000
-
 PENDING_FLUSH_AT = 1000
 
 
 def run(
-    claude: ClaudeComplianceClient,
+    client: AuditClient,
     egress: Egress,
     store: StateStore,
     initial_lookback_minutes: int = 60,
     now: datetime | None = None,
 ) -> dict:
-    """Pull new audit events and forward them to the configured egress sink."""
+    """Pull new audit events for one vendor and forward to the egress sink."""
     now = now or datetime.now(timezone.utc)
     state = store.load()
 
@@ -62,7 +55,8 @@ def run(
         first_run = True
 
     log.info(
-        "starting run first_run=%s window=[%s, %s] prior_ids=%d",
+        "%s: starting run first_run=%s window=[%s, %s] prior_ids=%d",
+        client.vendor,
         first_run,
         starting_at.isoformat(),
         now.isoformat(),
@@ -70,7 +64,7 @@ def run(
     )
 
     seen = set(state.recent_ids)
-    pending: list[ActivityEvent] = []
+    pending: list[AuditEvent] = []
     forwarded = 0
     skipped_duplicate = 0
     new_watermark = state.watermark
@@ -81,12 +75,10 @@ def run(
             return
         egress.send(ev.raw for ev in pending)
         forwarded += len(pending)
-        # Persist only after the egress sink ACKs so a later failure can't
-        # undo work that has already been accepted downstream.
         store.save(_compute_state(seen, new_watermark))
         pending.clear()
 
-    for ev in claude.fetch_window(starting_at, now):
+    for ev in client.fetch_window(starting_at, now):
         if ev.id in seen:
             skipped_duplicate += 1
             continue
@@ -100,18 +92,18 @@ def run(
     flush()
 
     summary = {
+        "vendor": client.vendor,
         "first_run": first_run,
         "forwarded": forwarded,
         "skipped_duplicate": skipped_duplicate,
         "watermark": new_watermark,
     }
-    log.info("run complete %s", summary)
+    log.info("%s: run complete %s", client.vendor, summary)
     return summary
 
 
 def _compute_state(seen: set[str], watermark: str | None) -> ForwarderState:
     if len(seen) > MAX_RECENT_IDS:
-        # Order is irrelevant — only membership matters — so trim arbitrarily.
         trimmed = list(seen)[-MAX_RECENT_IDS:]
     else:
         trimmed = list(seen)

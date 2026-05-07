@@ -1,11 +1,8 @@
 data "aws_caller_identity" "current" {}
 
-# A random external ID strengthens the cross-account trust policy beyond
-# "you know the role ARN." It's pasted into the XSIAM data source config
-# alongside the role ARN and SQS URL.
 resource "random_uuid" "xsiam_external_id" {}
 
-# ─── State table (watermark + recent content hashes) ──────────────────────
+# ─── Shared: state table ──────────────────────────────────────────────────
 resource "aws_dynamodb_table" "state" {
   name         = "${var.name_prefix}-state"
   billing_mode = "PAY_PER_REQUEST"
@@ -25,18 +22,7 @@ resource "aws_dynamodb_table" "state" {
   }
 }
 
-# ─── Anthropic API key secret ─────────────────────────────────────────────
-resource "aws_secretsmanager_secret" "anthropic_key" {
-  name_prefix = "${var.name_prefix}/anthropic-admin-key-"
-  description = "Anthropic Admin API key used to read Claude Compliance API events."
-}
-
-resource "aws_secretsmanager_secret_version" "anthropic_key" {
-  secret_id     = aws_secretsmanager_secret.anthropic_key.id
-  secret_string = var.anthropic_admin_api_key
-}
-
-# ─── Audit bucket (XSIAM pulls from this) ─────────────────────────────────
+# ─── Shared: audit bucket (vendor objects partitioned by prefix) ──────────
 resource "aws_s3_bucket" "audit" {
   bucket_prefix = "${var.name_prefix}-"
   force_destroy = false
@@ -83,28 +69,32 @@ resource "aws_s3_bucket_lifecycle_configuration" "audit" {
   }
 }
 
-# ─── SQS queue for ObjectCreated notifications ────────────────────────────
+# ─── Per-vendor: SQS queue (one XSIAM data source per vendor) ─────────────
 resource "aws_sqs_queue" "audit_dlq" {
-  name                       = "${var.name_prefix}-audit-dlq"
-  message_retention_seconds  = 1209600 # 14 days
+  for_each                   = var.vendors
+  name                       = "${var.name_prefix}-${each.key}-dlq"
+  message_retention_seconds  = 1209600
   sqs_managed_sse_enabled    = true
   visibility_timeout_seconds = 60
 }
 
 resource "aws_sqs_queue" "audit" {
-  name                       = "${var.name_prefix}-audit"
-  message_retention_seconds  = 345600 # 4 days
+  for_each                   = var.vendors
+  name                       = "${var.name_prefix}-${each.key}"
+  message_retention_seconds  = 345600
   sqs_managed_sse_enabled    = true
   visibility_timeout_seconds = 60
 
   redrive_policy = jsonencode({
-    deadLetterTargetArn = aws_sqs_queue.audit_dlq.arn
+    deadLetterTargetArn = aws_sqs_queue.audit_dlq[each.key].arn
     maxReceiveCount     = 5
   })
 }
 
-# Allow the bucket to publish ObjectCreated events to the queue.
+# Each per-vendor SQS queue accepts ObjectCreated notifications scoped to
+# that vendor's prefix in the shared bucket.
 data "aws_iam_policy_document" "sqs_from_s3" {
+  for_each = var.vendors
   statement {
     sid     = "AllowS3Notify"
     actions = ["sqs:SendMessage"]
@@ -112,7 +102,7 @@ data "aws_iam_policy_document" "sqs_from_s3" {
       type        = "Service"
       identifiers = ["s3.amazonaws.com"]
     }
-    resources = [aws_sqs_queue.audit.arn]
+    resources = [aws_sqs_queue.audit[each.key].arn]
     condition {
       test     = "ArnEquals"
       variable = "aws:SourceArn"
@@ -122,22 +112,27 @@ data "aws_iam_policy_document" "sqs_from_s3" {
 }
 
 resource "aws_sqs_queue_policy" "audit" {
-  queue_url = aws_sqs_queue.audit.id
-  policy    = data.aws_iam_policy_document.sqs_from_s3.json
+  for_each  = var.vendors
+  queue_url = aws_sqs_queue.audit[each.key].id
+  policy    = data.aws_iam_policy_document.sqs_from_s3[each.key].json
 }
 
 resource "aws_s3_bucket_notification" "audit" {
   bucket = aws_s3_bucket.audit.id
 
-  queue {
-    queue_arn = aws_sqs_queue.audit.arn
-    events    = ["s3:ObjectCreated:*"]
+  dynamic "queue" {
+    for_each = var.vendors
+    content {
+      queue_arn     = aws_sqs_queue.audit[queue.key].arn
+      events        = ["s3:ObjectCreated:*"]
+      filter_prefix = "${queue.key}/"
+    }
   }
 
   depends_on = [aws_sqs_queue_policy.audit]
 }
 
-# ─── Cross-account role XSIAM assumes to pull from S3+SQS ─────────────────
+# ─── Shared: cross-account IAM role XSIAM assumes ────────────────────────
 data "aws_iam_policy_document" "xsiam_assume" {
   statement {
     actions = ["sts:AssumeRole"]
@@ -155,24 +150,28 @@ data "aws_iam_policy_document" "xsiam_assume" {
 
 resource "aws_iam_role" "xsiam" {
   name               = "${var.name_prefix}-xsiam-ingest"
-  description        = "Assumed by Cortex XSIAM tenant to pull audit logs from S3 via SQS notifications."
+  description        = "Assumed by Cortex XSIAM to pull GenAI vendor audit logs."
   assume_role_policy = data.aws_iam_policy_document.xsiam_assume.json
 }
 
 data "aws_iam_policy_document" "xsiam" {
+  # Object-level access scoped to vendor prefixes (one Resource per vendor).
   statement {
     sid     = "ReadAuditObjects"
     actions = ["s3:GetObject"]
     resources = [
-      "${aws_s3_bucket.audit.arn}/*",
+      for v in keys(var.vendors) : "${aws_s3_bucket.audit.arn}/${v}/*"
     ]
   }
   statement {
-    sid     = "ListBucket"
-    actions = ["s3:ListBucket", "s3:GetBucketLocation"]
-    resources = [
-      aws_s3_bucket.audit.arn,
-    ]
+    sid       = "ListBucket"
+    actions   = ["s3:ListBucket", "s3:GetBucketLocation"]
+    resources = [aws_s3_bucket.audit.arn]
+    condition {
+      test     = "StringLike"
+      variable = "s3:prefix"
+      values   = [for v in keys(var.vendors) : "${v}/*"]
+    }
   }
   statement {
     sid = "ConsumeNotifications"
@@ -182,7 +181,7 @@ data "aws_iam_policy_document" "xsiam" {
       "sqs:GetQueueAttributes",
       "sqs:GetQueueUrl",
     ]
-    resources = [aws_sqs_queue.audit.arn]
+    resources = [for v in keys(var.vendors) : aws_sqs_queue.audit[v].arn]
   }
 }
 
@@ -191,7 +190,20 @@ resource "aws_iam_role_policy" "xsiam" {
   policy = data.aws_iam_policy_document.xsiam.json
 }
 
-# ─── Lambda IAM ───────────────────────────────────────────────────────────
+# ─── Per-vendor: API key secret ───────────────────────────────────────────
+resource "aws_secretsmanager_secret" "api_key" {
+  for_each    = var.vendors
+  name_prefix = "${var.name_prefix}/${each.key}-api-key-"
+  description = "API key for the ${each.key} audit log forwarder."
+}
+
+resource "aws_secretsmanager_secret_version" "api_key" {
+  for_each      = var.vendors
+  secret_id     = aws_secretsmanager_secret.api_key[each.key].id
+  secret_string = var.api_keys[each.key]
+}
+
+# ─── Per-vendor: Lambda IAM role + policy ─────────────────────────────────
 data "aws_iam_policy_document" "lambda_assume" {
   statement {
     actions = ["sts:AssumeRole"]
@@ -203,42 +215,43 @@ data "aws_iam_policy_document" "lambda_assume" {
 }
 
 resource "aws_iam_role" "lambda" {
-  name               = "${var.name_prefix}-lambda"
+  for_each           = var.vendors
+  name               = "${var.name_prefix}-${each.key}-lambda"
   assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
 }
 
 data "aws_iam_policy_document" "lambda" {
+  for_each = var.vendors
+
   statement {
     sid       = "Logs"
     actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
     resources = ["arn:aws:logs:${var.region}:${data.aws_caller_identity.current.account_id}:*"]
   }
-
   statement {
     sid       = "State"
     actions   = ["dynamodb:GetItem", "dynamodb:PutItem"]
     resources = [aws_dynamodb_table.state.arn]
   }
-
   statement {
     sid       = "Secret"
     actions   = ["secretsmanager:GetSecretValue"]
-    resources = [aws_secretsmanager_secret.anthropic_key.arn]
+    resources = [aws_secretsmanager_secret.api_key[each.key].arn]
   }
-
   statement {
     sid       = "WriteAuditObjects"
     actions   = ["s3:PutObject"]
-    resources = ["${aws_s3_bucket.audit.arn}/*"]
+    resources = ["${aws_s3_bucket.audit.arn}/${each.key}/*"]
   }
 }
 
 resource "aws_iam_role_policy" "lambda" {
-  role   = aws_iam_role.lambda.id
-  policy = data.aws_iam_policy_document.lambda.json
+  for_each = var.vendors
+  role     = aws_iam_role.lambda[each.key].id
+  policy   = data.aws_iam_policy_document.lambda[each.key].json
 }
 
-# ─── Lambda package & function ────────────────────────────────────────────
+# ─── Per-vendor: Lambda + log group + EventBridge schedule ────────────────
 data "archive_file" "lambda_zip" {
   type        = "zip"
   source_dir  = "${path.module}/../../src"
@@ -246,6 +259,7 @@ data "archive_file" "lambda_zip" {
   excludes = [
     "forwarder/__pycache__",
     "forwarder/egress/__pycache__",
+    "forwarder/vendors/__pycache__",
     "forwarder/gcp_handler.py",
     "forwarder/state_gcp.py",
     "forwarder/egress/pubsub.py",
@@ -255,13 +269,16 @@ data "archive_file" "lambda_zip" {
 }
 
 resource "aws_cloudwatch_log_group" "lambda" {
-  name              = "/aws/lambda/${var.name_prefix}"
+  for_each          = var.vendors
+  name              = "/aws/lambda/${var.name_prefix}-${each.key}"
   retention_in_days = var.log_retention_days
 }
 
 resource "aws_lambda_function" "forwarder" {
-  function_name    = var.name_prefix
-  role             = aws_iam_role.lambda.arn
+  for_each = var.vendors
+
+  function_name    = "${var.name_prefix}-${each.key}"
+  role             = aws_iam_role.lambda[each.key].arn
   handler          = "forwarder.aws_handler.handler"
   runtime          = "python3.12"
   filename         = data.archive_file.lambda_zip.output_path
@@ -271,32 +288,35 @@ resource "aws_lambda_function" "forwarder" {
 
   environment {
     variables = {
+      VENDOR                   = each.key
       STATE_TABLE              = aws_dynamodb_table.state.name
-      ANTHROPIC_KEY_SECRET_ARN = aws_secretsmanager_secret.anthropic_key.arn
+      API_KEY_SECRET_ARN       = aws_secretsmanager_secret.api_key[each.key].arn
       AUDIT_BUCKET             = aws_s3_bucket.audit.bucket
-      AUDIT_PREFIX             = "claude-compliance"
-      INITIAL_LOOKBACK_MINUTES = tostring(var.initial_lookback_minutes)
+      AUDIT_PREFIX             = "audit"
+      INITIAL_LOOKBACK_MINUTES = tostring(each.value.initial_lookback_minutes)
     }
   }
 
   depends_on = [aws_cloudwatch_log_group.lambda]
 }
 
-# ─── Schedule ─────────────────────────────────────────────────────────────
 resource "aws_cloudwatch_event_rule" "tick" {
-  name                = "${var.name_prefix}-tick"
-  schedule_expression = "rate(${var.schedule_minutes} minutes)"
+  for_each            = var.vendors
+  name                = "${var.name_prefix}-${each.key}-tick"
+  schedule_expression = "rate(${each.value.schedule_minutes} minutes)"
 }
 
 resource "aws_cloudwatch_event_target" "tick" {
-  rule = aws_cloudwatch_event_rule.tick.name
-  arn  = aws_lambda_function.forwarder.arn
+  for_each = var.vendors
+  rule     = aws_cloudwatch_event_rule.tick[each.key].name
+  arn      = aws_lambda_function.forwarder[each.key].arn
 }
 
 resource "aws_lambda_permission" "tick" {
+  for_each      = var.vendors
   statement_id  = "AllowEventBridgeInvoke"
   action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.forwarder.function_name
+  function_name = aws_lambda_function.forwarder[each.key].function_name
   principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.tick.arn
+  source_arn    = aws_cloudwatch_event_rule.tick[each.key].arn
 }

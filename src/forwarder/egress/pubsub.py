@@ -3,10 +3,14 @@
 XSIAM's "GCP Pub/Sub" data source pulls from a customer-owned subscription
 using a service account credentials file. We publish; XSIAM consumes.
 
-Each audit event becomes one Pub/Sub message:
-- `data` is the raw Compliance API event JSON (UTF-8 bytes)
-- `attributes` carry small routing/filter hints (event type, actor user_id,
-  client_platform) for any XSIAM-side filtering needs without parsing the body
+Each event becomes one Pub/Sub message:
+- `data` is the raw vendor-native event JSON (UTF-8 bytes).
+- `attributes` carry small routing/filter hints — most importantly `vendor`
+  so a single Pub/Sub topic can carry multiple vendors and XSIAM-side
+  filtering or per-vendor subscriptions can split them out. Per-vendor
+  attributes (activity_type, actor_*) are extracted with vendor-aware logic
+  so OpenAI's nested actor schema and Anthropic's flat-with-discriminator
+  schema both produce useful filter keys.
 
 We block on each publish future to surface failures synchronously, so the
 forwarder can refuse to advance the watermark past unsent events.
@@ -22,13 +26,15 @@ log = logging.getLogger(__name__)
 
 
 class PubSubEgress:
-    def __init__(self, project: str, topic: str, publisher=None):
+    def __init__(self, project: str, topic: str, vendor: str, publisher=None):
         self._project = project
         self._topic = topic
+        self._vendor = vendor
         if publisher is not None:
             self._publisher = publisher
         else:
             from google.cloud import pubsub_v1  # deferred for dev import
+
             self._publisher = pubsub_v1.PublisherClient(
                 publisher_options=pubsub_v1.types.PublisherOptions(
                     enable_message_ordering=False,
@@ -47,13 +53,12 @@ class PubSubEgress:
             attrs = self._attributes(ev)
             futures.append(self._publisher.publish(self._topic_path, data, **attrs))
 
-        # Block on every future. If any raises, the exception propagates and
-        # core.run() will not advance the watermark past this batch.
         for fut in futures:
             fut.result(timeout=30)
 
         log.info(
-            "published %d events to projects/%s/topics/%s",
+            "%s: published %d events to projects/%s/topics/%s",
+            self._vendor,
             len(materialized),
             self._project,
             self._topic,
@@ -62,9 +67,17 @@ class PubSubEgress:
 
     def _attributes(self, ev: dict) -> dict:
         # Pub/Sub attribute values have a 1024-byte cap; keep them tiny.
-        # Schema follows Compliance API Rev J Activity object: top-level
-        # `type` and `organization_id`, nested `actor.user_id` / `actor.type`.
-        attrs = {}
+        attrs: dict = {"vendor": self._vendor}
+        if self._vendor == "anthropic":
+            self._anthropic_attrs(ev, attrs)
+        elif self._vendor == "openai":
+            self._openai_attrs(ev, attrs)
+        return attrs
+
+    @staticmethod
+    def _anthropic_attrs(ev: dict, attrs: dict) -> None:
+        # Compliance API Rev J Activity object: top-level `type`,
+        # `organization_id`; nested `actor.{type, user_id, api_key_id}`.
         if isinstance(ev.get("type"), str):
             attrs["activity_type"] = ev["type"][:256]
         if isinstance(ev.get("organization_id"), str):
@@ -76,4 +89,25 @@ class PubSubEgress:
             attrs["actor_user_id"] = actor["user_id"][:256]
         elif isinstance(actor.get("api_key_id"), str):
             attrs["actor_api_key_id"] = actor["api_key_id"][:256]
-        return attrs
+
+    @staticmethod
+    def _openai_attrs(ev: dict, attrs: dict) -> None:
+        # OpenAI Audit Logs object: top-level `type`, `project.id`; nested
+        # actor as either actor.session.user.{id, email} or
+        # actor.api_key.{id, type, user.id}.
+        if isinstance(ev.get("type"), str):
+            attrs["activity_type"] = ev["type"][:256]
+        project = ev.get("project") or {}
+        if isinstance(project.get("id"), str):
+            attrs["project_id"] = project["id"][:64]
+        actor = ev.get("actor") or {}
+        if "session" in actor and isinstance(actor["session"], dict):
+            attrs["actor_type"] = "session"
+            user = actor["session"].get("user") or {}
+            if isinstance(user.get("id"), str):
+                attrs["actor_user_id"] = user["id"][:256]
+        elif "api_key" in actor and isinstance(actor["api_key"], dict):
+            attrs["actor_type"] = "api_key"
+            ak = actor["api_key"]
+            if isinstance(ak.get("id"), str):
+                attrs["actor_api_key_id"] = ak["id"][:256]

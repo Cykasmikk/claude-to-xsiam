@@ -4,7 +4,7 @@ variable "project_id" {
 }
 
 variable "region" {
-  description = "GCP region for the Cloud Function & Scheduler."
+  description = "GCP region for the Cloud Functions & Scheduler."
   type        = string
   default     = "us-central1"
 }
@@ -12,32 +12,53 @@ variable "region" {
 variable "name_prefix" {
   description = "Prefix applied to all resources."
   type        = string
-  default     = "claude-xsiam-forwarder"
+  default     = "genai-audit-xsiam-forwarder"
 }
 
-variable "anthropic_admin_api_key" {
-  description = "Anthropic Admin API key (sk-ant-admin01-...) with Compliance API scope."
-  type        = string
+variable "vendors" {
+  description = <<-EOT
+    Map of vendor name → vendor-specific NON-SENSITIVE config. Each entry
+    creates a dedicated Cloud Function, Cloud Scheduler trigger, audit
+    Pub/Sub topic, XSIAM-bound subscription, secret, and IAM bindings.
+
+    Supported vendor keys: "anthropic", "openai".
+
+    API keys are passed separately via var.api_keys (sensitive). Terraform
+    forbids sensitive values as for_each keys, so they're split.
+  EOT
+  type = map(object({
+    schedule_minutes         = optional(number, 5)
+    initial_lookback_minutes = optional(number, 60)
+  }))
+
+  validation {
+    condition     = alltrue([for k in keys(var.vendors) : contains(["anthropic", "openai"], k)])
+    error_message = "vendors map keys must be one of: anthropic, openai."
+  }
+  validation {
+    condition     = length(var.vendors) > 0
+    error_message = "Provide at least one vendor in var.vendors."
+  }
+}
+
+variable "api_keys" {
+  description = <<-EOT
+    Map of vendor name → API key. Keys must match those in var.vendors.
+
+    Anthropic: sk-ant-admin01-... (Admin key) or sk-ant-api01-... (Compliance).
+    OpenAI:    sk-admin-...
+  EOT
+  type        = map(string)
   sensitive   = true
-}
 
-variable "schedule_minutes" {
-  description = "Cloud Scheduler cadence in minutes."
-  type        = number
-  default     = 5
-}
-
-variable "initial_lookback_minutes" {
-  description = "On first run (no state), how far back to pull events from."
-  type        = number
-  default     = 60
+  validation {
+    condition     = alltrue([for k in keys(var.api_keys) : contains(["anthropic", "openai"], k)])
+    error_message = "api_keys map keys must be one of: anthropic, openai."
+  }
 }
 
 variable "subscription_message_retention_seconds" {
-  description = <<-EOT
-    Retention on the XSIAM-bound subscription. Long enough to absorb XSIAM
-    outages (default: 7 days, the Pub/Sub maximum).
-  EOT
+  description = "Retention on each XSIAM-bound subscription. Default: 7 days (Pub/Sub max)."
   type        = number
   default     = 604800
 }

@@ -6,18 +6,20 @@ https://github.com/PaloAltoNetworks/terraform-umbrella-s3-to-xsiam-ingestion-mod
 
 Object layout
 -------------
-    s3://{bucket}/{prefix}/{yyyy}/{mm}/{dd}/{hh}/{run_id}.jsonl.gz
+    s3://{bucket}/{vendor}/{prefix}/{yyyy}/{mm}/{dd}/{hh}/{run_id}.jsonl.gz
 
-One Lambda invocation produces at most one object. Hour partitioning matches
-the convention XSIAM expects for time-window scans and matches CloudTrail/
-GuardDuty/ALB log layouts already in the SOC.
+The leading `{vendor}/` segment lets XSIAM operators configure separate
+data sources (and therefore separate datasets) per vendor: one source
+listening for ObjectCreated notifications matching `anthropic/*`, another
+for `openai/*`. SQS notification filters can be configured to deliver
+events for one prefix only.
 
 Format
 ------
-- Newline-delimited JSON, one event per line (the raw Compliance API payload).
-- gzip compressed (`Content-Encoding: gzip`, `Content-Type: application/x-ndjson`).
-- Server-side encrypted (the bucket's default policy enforces this; we set
-  `ServerSideEncryption=AES256` defensively in case the bucket policy lapses).
+- Newline-delimited JSON, one event per line (the raw vendor payload).
+- gzip compressed (`Content-Encoding: gzip`,
+  `Content-Type: application/x-ndjson`).
+- Server-side encrypted (AES256 — defensive in case the bucket policy lapses).
 """
 
 from __future__ import annotations
@@ -37,21 +39,21 @@ class S3Egress:
     def __init__(
         self,
         bucket: str,
-        prefix: str = "claude-compliance",
+        vendor: str,
+        prefix: str = "audit",
         s3_client=None,
     ):
         self._bucket = bucket
+        self._vendor = vendor
         self._prefix = prefix.strip("/")
         if s3_client is not None:
             self._s3 = s3_client
         else:
             import boto3  # deferred so the module imports without boto3
+
             self._s3 = boto3.client("s3")
 
     def send(self, events: Iterable[dict]) -> int:
-        # Materialize once: we need the count and a stable byte stream, and
-        # audit-log batches are small enough (≤ thousands per run) that the
-        # memory cost is negligible.
         materialized = list(events)
         if not materialized:
             return 0
@@ -66,9 +68,11 @@ class S3Egress:
             ContentType="application/x-ndjson",
             ContentEncoding="gzip",
             ServerSideEncryption="AES256",
+            Metadata={"vendor": self._vendor},
         )
         log.info(
-            "wrote %d events to s3://%s/%s (%d bytes gzipped)",
+            "%s: wrote %d events to s3://%s/%s (%d bytes gzipped)",
+            self._vendor,
             len(materialized),
             self._bucket,
             key,
@@ -88,7 +92,7 @@ class S3Egress:
         now = datetime.now(timezone.utc)
         run_id = uuid.uuid4().hex[:12]
         return (
-            f"{self._prefix}/"
+            f"{self._vendor}/{self._prefix}/"
             f"{now:%Y/%m/%d/%H}/"
             f"{now:%Y%m%dT%H%M%SZ}-{run_id}.jsonl.gz"
         )

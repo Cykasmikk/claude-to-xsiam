@@ -1,32 +1,31 @@
-output "function_name" {
-  value = google_cloudfunctions2_function.forwarder.name
+output "function_names" {
+  description = "Per-vendor Cloud Function names."
+  value       = { for k, fn in google_cloudfunctions2_function.forwarder : k => fn.name }
 }
 
-output "function_uri" {
-  value = google_cloudfunctions2_function.forwarder.service_config[0].uri
+output "scheduler_jobs" {
+  description = "Per-vendor Scheduler tick jobs."
+  value       = { for k, j in google_cloud_scheduler_job.tick : k => j.name }
 }
 
-output "scheduler_job" {
-  value = google_cloud_scheduler_job.tick.name
+# ─── XSIAM data source onboarding values ──────────────────────────────────
+output "xsiam_audit_topics" {
+  description = "Per-vendor Pub/Sub audit topics."
+  value       = { for k, t in google_pubsub_topic.audit : k => t.id }
 }
 
-# ─── Values to paste into the XSIAM "GCP Pub/Sub" data source ─────────────
-output "xsiam_audit_topic" {
-  description = "Pub/Sub topic where audit events are published."
-  value       = google_pubsub_topic.audit.id
-}
-
-output "xsiam_audit_subscription" {
-  description = "Pull subscription XSIAM consumes. Paste this into the data source 'subscription' field."
-  value       = google_pubsub_subscription.xsiam.id
+output "xsiam_audit_subscriptions" {
+  description = "Per-vendor pull subscriptions XSIAM consumes — paste each into one XSIAM data source."
+  value       = { for k, s in google_pubsub_subscription.xsiam : k => s.id }
 }
 
 output "xsiam_service_account_email" {
   description = <<-EOT
-    Service account XSIAM authenticates as. Generate a JSON key for this SA
-    out-of-band (gcloud iam service-accounts keys create) and paste the JSON
-    into the XSIAM data source 'credentials' field. Do NOT add a
-    google_service_account_key resource here — that puts the key in TF state.
+    Single SA XSIAM authenticates as for all vendors. Generate a JSON key
+    out-of-band (gcloud iam service-accounts keys create) and paste into
+    each XSIAM data source 'credentials' field. Do NOT add a
+    google_service_account_key resource — keys in TF state are an audit
+    smell.
   EOT
   value       = google_service_account.xsiam.email
 }

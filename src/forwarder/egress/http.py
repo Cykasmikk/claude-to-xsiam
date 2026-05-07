@@ -4,15 +4,16 @@ Direct POST to the XSIAM HTTP Log Collector at
 `https://api-{tenant}.xdr.{region}.paloaltonetworks.com/logs/v1/event`.
 
 Use this only when the cloud-native paths (S3+SQS / Pub/Sub) aren't viable.
-The native paths are preferred because they buffer naturally, replay easily,
-and match the cross-account IAM-role auditing pattern the SOC uses elsewhere.
+The native paths are preferred because they buffer naturally, replay
+easily, and match the cross-account IAM-role auditing pattern the SOC uses
+elsewhere.
 
 Per the public XSIAM HTTP Collector reference:
 - ≤5 MB per event, ≤9.5 MB per batch (we cap conservatively at 4 MB).
 - JSON body, `Content-Type: application/json`.
 - Auth header name and gzip support are NOT publicly documented at the
-  exact level needed; the defaults below are aligned with Cribl's published
-  XSIAM destination integration but should be verified against your tenant's
+  exact level needed; the defaults below align with Cribl's published XSIAM
+  destination integration but should be verified against your tenant's
   HTTP Collector configuration screen before production.
 """
 
@@ -36,9 +37,9 @@ MAX_BATCH_BYTES = 4 * 1024 * 1024
 class HttpEgressConfig:
     url: str
     token: str
-    auth_header: str = "Authorization"  # TODO(verify): some collectors use x-xdr-auth-id pair
-    vendor: str = "anthropic"
-    product: str = "claude_compliance_audit"
+    vendor: str
+    auth_header: str = "Authorization"
+    product: str = "audit_log"  # vendor-prefixed at runtime
     use_gzip: bool = True
 
 
@@ -69,14 +70,24 @@ class HttpEgress:
         return sent
 
     def _enrich(self, ev: dict) -> dict:
-        # Activity object schema (Compliance API Rev J): top-level `type`
-        # carries the event kind (e.g. claude_chat_created); pass it through
-        # as `_event` for XSIAM routing/filter convenience.
+        # Vendors emit different time-field names, so derive _time per vendor.
+        if self._cfg.vendor == "anthropic":
+            t = ev.get("created_at")
+            ev_type = ev.get("type")
+        elif self._cfg.vendor == "openai":
+            ts = ev.get("effective_at")
+            t = (
+                _unix_to_iso(int(ts)) if isinstance(ts, (int, float)) else None
+            )
+            ev_type = ev.get("type")
+        else:
+            t = ev.get("created_at") or ev.get("effective_at")
+            ev_type = ev.get("type")
         return {
             "_vendor": self._cfg.vendor,
-            "_product": self._cfg.product,
-            "_time": ev.get("created_at"),
-            "_event": ev.get("type"),
+            "_product": f"{self._cfg.vendor}_{self._cfg.product}",
+            "_time": t,
+            "_event": ev_type,
             "event": ev,
         }
 
@@ -109,3 +120,13 @@ class HttpEgress:
                 backoff *= 2
                 continue
             raise RuntimeError(f"XSIAM HTTP {r.status}: {r.data[:500]!r}")
+
+
+def _unix_to_iso(ts: int) -> str:
+    from datetime import datetime, timezone
+
+    return (
+        datetime.fromtimestamp(int(ts), tz=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )

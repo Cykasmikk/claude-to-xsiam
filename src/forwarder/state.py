@@ -1,14 +1,12 @@
 """Forwarder state backend protocol.
 
-The Compliance API Activity Feed assigns every event a stable `id` of the
-form `activity_xxx`, so dedupe keys directly off that — no content hashing
-needed.
+State documents are namespaced by vendor so multiple vendors share one
+DynamoDB table / Firestore collection without cross-contamination.
 
-Persisted state:
-  - `watermark`: ISO 8601 `created_at` of the latest event we've forwarded.
-  - `recent_ids`: bounded set of activity IDs at-or-near the watermark.
-    Used to dedupe the inevitable overlap when the next poll re-queries the
-    boundary window to handle clock skew and out-of-order delivery.
+Persisted state per vendor:
+  - `watermark`: ISO 8601 created_at of the latest event we've forwarded.
+  - `recent_ids`: bounded set of activity IDs at-or-near the watermark for
+    overlap-window dedupe.
 """
 
 from __future__ import annotations
@@ -19,7 +17,7 @@ from typing import Protocol
 
 @dataclass
 class ForwarderState:
-    watermark: str | None = None  # ISO 8601 created_at of newest forwarded event
+    watermark: str | None = None
     recent_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -37,5 +35,10 @@ class ForwarderState:
 
 
 class StateStore(Protocol):
+    """Per-vendor state store. Implementations are constructed for one
+    vendor and isolate that vendor's state from others."""
+
+    vendor: str
+
     def load(self) -> ForwarderState: ...
     def save(self, state: ForwarderState) -> None: ...

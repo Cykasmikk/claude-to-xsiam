@@ -1,18 +1,20 @@
-output "lambda_function_name" {
-  value = aws_lambda_function.forwarder.function_name
+output "lambda_function_names" {
+  description = "Per-vendor Lambda function names."
+  value       = { for k, fn in aws_lambda_function.forwarder : k => fn.function_name }
 }
 
-output "log_group" {
-  value = aws_cloudwatch_log_group.lambda.name
+output "log_groups" {
+  description = "Per-vendor CloudWatch log group names."
+  value       = { for k, lg in aws_cloudwatch_log_group.lambda : k => lg.name }
 }
 
 output "state_table" {
   value = aws_dynamodb_table.state.name
 }
 
-# ─── Values to paste into the XSIAM "Amazon S3 generic logs" data source ──
+# ─── XSIAM data source onboarding values ──────────────────────────────────
 output "xsiam_role_arn" {
-  description = "IAM role ARN that XSIAM should assume to ingest audit logs."
+  description = "Single IAM role assumed by XSIAM for all vendors."
   value       = aws_iam_role.xsiam.arn
 }
 
@@ -22,12 +24,12 @@ output "xsiam_external_id" {
   sensitive   = true
 }
 
-output "xsiam_sqs_url" {
-  description = "SQS queue URL XSIAM polls for S3 ObjectCreated notifications."
-  value       = aws_sqs_queue.audit.url
+output "xsiam_sqs_urls" {
+  description = "Per-vendor SQS queue URL — configure one XSIAM data source per vendor pointing at its queue."
+  value       = { for k, q in aws_sqs_queue.audit : k => q.url }
 }
 
 output "audit_bucket" {
-  description = "S3 bucket holding gzipped JSON-lines audit objects."
+  description = "Shared S3 bucket. Vendor objects are under /<vendor>/ prefixes."
   value       = aws_s3_bucket.audit.bucket
 }
