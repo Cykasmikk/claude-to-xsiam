@@ -187,8 +187,11 @@ its own IAM role with access to the `cowork/` prefix.
 | `vendors map keys must be one of: anthropic, anthropic_chats, openai, openai_conversations` | Typo in vendor key | Use exact names from the list |
 | `Variables not allowed` on `terraform validate` | `${...}` in a description heredoc | Escape with `$$` |
 | `NoRegionError: You must specify a region` from boto3 in tests | Module-level boto3 client construction outside Lambda | Already fixed (lazy-init); pull latest |
-| Lambda errors with `AnthropicComplianceAPIError ... HTTP 403` | Compliance API not enabled, OR using Admin key for `anthropic_chats` | Enable Compliance API; for content feeds, use `sk-ant-api01-` Compliance Access Key |
+| Lambda errors with `AnthropicComplianceAPIError ... HTTP 404` | Org doesn't have Compliance API enabled | Anthropic returns 404 (not 403) when an org doesn't have Compliance API enabled. Enable per [vendors/anthropic.md](vendors/anthropic.md#enablement). |
+| Lambda errors with `AnthropicComplianceAPIError ... HTTP 403` | Compliance API enabled but the key lacks scope, OR using Admin key for `anthropic_chats` | For content feeds, use `sk-ant-api01-` Compliance Access Key |
+| Lambda errors with `OpenAIAuditAPIError ... HTTP 401` | Placeholder/invalid key (auth failure on the literal token) | Provision a real `sk-admin-` admin key; update the secret value via `terraform apply` |
 | Lambda errors with `OpenAIAuditAPIError ... HTTP 403` | Audit logging not enabled in OpenAI org settings | Enable in *Org settings → Data controls → Data retention → Audit logging* |
+| `terraform destroy` hangs silently on the audit bucket | Bucket has objects (your own test uploads, or any forwarded events not yet aged out by the lifecycle rule). The Terraform sets `force_destroy = false` to prevent accidental deletion of audit history | Empty the bucket manually before destroy: `aws s3api list-object-versions ...` then `aws s3api delete-object ...` per version. Or set `force_destroy = true` on `aws_s3_bucket.audit` in `terraform/aws/main.tf` for ephemeral test deploys (NOT production). |
 | XSIAM dataset is empty after first tick | Either no events occurred in the lookback window, OR the SQS queue has no S3 notifications wired | Run an admin action in the source platform; check `aws_s3_bucket_notification` config |
 
 For runbook-level operations (key rotation, backfill, alarms) see
