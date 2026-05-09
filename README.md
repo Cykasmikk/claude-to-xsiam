@@ -123,6 +123,7 @@ in [docs/xsiam-integration.md](docs/xsiam-integration.md#xql-recipes).
 | [docs/vendors/anthropic.md](docs/vendors/anthropic.md) | Anthropic-specific setup detail |
 | [docs/vendors/openai.md](docs/vendors/openai.md) | OpenAI-specific setup detail |
 | [docs/xsiam-integration.md](docs/xsiam-integration.md) | XSIAM operators — data source onboarding, XQL recipes |
+| [docs/analytics.md](docs/analytics.md) | BigQuery+Looker Studio / Athena+QuickSight dashboards over the same audit data |
 | [cowork-otel/README.md](cowork-otel/README.md) | Cowork OTel collector deployment |
 
 ## Repository layout
@@ -136,6 +137,8 @@ src/forwarder/        Python forwarder package
 terraform/aws/        Multi-feed Lambda + S3 + SQS + DynamoDB stack
 terraform/gcp/        Multi-feed Cloud Function + Pub/Sub + Firestore stack
 cowork-otel/          OTel collector for Claude Code + Cowork (separate stack)
+analytics/            Optional BigQuery+Looker Studio / Athena+QuickSight layer
+                      with a SOC SQL query library
 docs/                 Operator documentation (this directory)
 tests/smoke.py        47 deterministic tests (no AWS/GCP creds needed)
 .github/workflows/    CI — runs smoke + terraform validate per PR

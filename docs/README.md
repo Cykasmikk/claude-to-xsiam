@@ -11,6 +11,7 @@
 | [vendors/anthropic.md](vendors/anthropic.md) | Anthropic-specific setup | Compliance API enablement, Activity Feed + chat content, key types, Cowork OTel pairing |
 | [vendors/openai.md](vendors/openai.md) | OpenAI-specific setup | Audit Logs setup, Conversations skeleton notes, Palo Alto native integration alternative |
 | [xsiam-integration.md](xsiam-integration.md) | XSIAM operators | Data source onboarding per ingestion path, parser hints per feed, XQL recipe library, cross-feed correlation |
+| [analytics.md](analytics.md) | Analytics / dashboard owners | Optional BigQuery+Looker Studio (GCP) and Athena+QuickSight (AWS) layer over the same audit data, with a SOC SQL query library |
 
 For the standalone Cowork OTel collector, see
 [../cowork-otel/README.md](../cowork-otel/README.md).

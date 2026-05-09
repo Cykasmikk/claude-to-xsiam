@@ -37,7 +37,7 @@ jobs:
       - name: pip-audit (deps CVE scan)
         run: pip-audit -r src/requirements.txt
 
-      - name: "Smoke test (47 cases) with coverage"
+      - name: "Smoke test (48 cases) with coverage"
         env:
           PYTHONPATH: src
         run: |
@@ -54,6 +54,8 @@ jobs:
           - terraform/gcp
           - cowork-otel/terraform/aws
           - cowork-otel/terraform/gcp
+          - analytics/terraform/aws
+          - analytics/terraform/gcp
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
@@ -76,6 +78,8 @@ jobs:
           - terraform/gcp
           - cowork-otel/terraform/aws
           - cowork-otel/terraform/gcp
+          - analytics/terraform/aws
+          - analytics/terraform/gcp
     steps:
       - uses: actions/checkout@v4
       - uses: bridgecrewio/checkov-action@v12
@@ -83,6 +87,11 @@ jobs:
           directory: ${{ matrix.stack }}
           quiet: true
           soft_fail: false
+          # Skip the secrets-scan framework — gitleaks job already covers
+          # repo-wide secret detection, and checkov's secrets runner has a
+          # known parallel-runner edge case that fails noisily on some
+          # filesystems.
+          skip_framework: secrets
 
   gitleaks:
     name: gitleaks
