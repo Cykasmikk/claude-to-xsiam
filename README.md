@@ -28,35 +28,44 @@ inference visibility:**
 ## Architecture at a glance
 
 ```
-                    ┌──────────────────────────────────────┐
-                    │         Cortex XSIAM                 │
-                    │  (one data source per feed, datasets │
-                    │   partitioned by vendor / content)   │
-                    └─────────────▲────────────────────────┘
-                                  │ pulls native S3+SQS / Pub-Sub
-                                  │
-        ┌─────────────────────────┴────────────────────────┐
-        │                                                  │
-   ┌────▼─────────────┐                          ┌─────────▼──────┐
-   │ Polling fan-out  │                          │ Push collector │
-   │  (Lambda × N /   │                          │  (ECS Fargate /│
-   │   Function × N)  │                          │   Cloud Run)   │
-   │                  │                          │                │
-   │ anthropic        │                          │ OTLP HTTP      │
-   │ anthropic_chats  │                          │ + bearer auth  │
-   │ openai           │                          │                │
-   │ openai_convs     │                          │                │
-   └────▲─────────────┘                          └─────▲──────────┘
-        │ paginated audit/content                      │ OTLP push
-        │                                              │
-   ┌────┴─────────────┐                          ┌─────┴──────────┐
-   │ Anthropic /      │                          │ Cowork backend │
-   │ OpenAI APIs      │                          │ + Claude Code  │
-   └──────────────────┘                          └────────────────┘
+   ┌──────────────────────────────────────┐    ┌──────────────────────────────────────┐
+   │         Cortex XSIAM                 │    │ Optional analytics warehouse         │
+   │  (one data source per feed, datasets │    │   GCP: BigQuery + Looker Studio      │
+   │   partitioned by vendor / content)   │    │   AWS: Athena + QuickSight (or alt)  │
+   └─────────────▲────────────────────────┘    └─────────────▲────────────────────────┘
+                 │ pulls native S3+SQS / Pub-Sub             │ Pub/Sub→BQ sub  /  Glue+S3
+                 │                                           │
+        ┌────────┴──────────────────────────────────────────┴──────────────┐
+        │                              S3 (AWS) / Pub/Sub (GCP)            │
+        │              ▲                                  ▲                │
+        └──────────────┼──────────────────────────────────┼────────────────┘
+                       │                                  │
+                ┌──────┴──────────┐                ┌──────┴──────────┐
+                │ Polling fan-out │                │ Push collector  │
+                │  (Lambda × N /  │                │  (ECS Fargate / │
+                │   Function × N) │                │   Cloud Run)    │
+                │                 │                │                 │
+                │ anthropic       │                │ OTLP HTTP       │
+                │ anthropic_chats │                │ + bearer auth   │
+                │ openai          │                │                 │
+                │ openai_convs    │                │                 │
+                └──────▲──────────┘                └──────▲──────────┘
+                       │ paginated audit/content          │ OTLP push
+                       │                                  │
+                ┌──────┴──────────┐                ┌──────┴──────────┐
+                │ Anthropic /     │                │ Cowork backend  │
+                │ OpenAI APIs     │                │ + Claude Code   │
+                └─────────────────┘                └─────────────────┘
 ```
+
+The analytics warehouse is **optional** — XSIAM is the primary
+destination. Use the analytics tier for ad-hoc SOC exploration,
+exec dashboards, or self-serve queries without XSIAM seats. Both
+consume the same upstream feeds independently.
 
 See [docs/architecture.md](docs/architecture.md) for dataflow diagrams,
 the vendor-adapter pattern, and parallel-execution guarantees.
+[docs/analytics.md](docs/analytics.md) covers the optional warehouse.
 
 ## Quickstart
 
@@ -104,11 +113,32 @@ or subscription name + SA email on GCP). Paste these into one XSIAM
 data source per feed. Worked examples:
 [docs/xsiam-integration.md](docs/xsiam-integration.md).
 
-### 5. Verify
+### 5. (Optional) Deploy the analytics warehouse
+
+For BigQuery + Looker Studio (GCP) or Athena + QuickSight (AWS) on
+top of the same data — useful when the SOC team wants ad-hoc SQL
+exploration without XSIAM seats:
+
+```bash
+cd analytics/terraform/gcp    # or analytics/terraform/aws
+terraform init
+terraform apply
+```
+
+GCP analytics is essentially **free** at audit volume (Looker Studio
+is free; BigQuery free tier covers it). AWS Athena costs pennies;
+QuickSight is **$18-24/user/month** but the same Athena workgroup
+works with Tableau / Metabase / Grafana if you prefer. See
+[analytics/README.md](analytics/README.md) for setup + cost details
+and [analytics/sql/](analytics/sql/) for the SOC query library.
+
+### 6. Verify
 
 XQL example library across all five feeds — failed-login spikes,
 prompt-content DLP regex, cross-vendor API-key creation tracking — is
 in [docs/xsiam-integration.md](docs/xsiam-integration.md#xql-recipes).
+SQL equivalents (BigQuery + Athena dialects) for the analytics tier
+are in [analytics/sql/](analytics/sql/).
 
 ## Documentation
 
